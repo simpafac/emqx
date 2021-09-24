@@ -104,6 +104,50 @@ mnesia(copy) ->
     ok = ekka_mnesia:copy_table(?SESS_MSG_TAB, ram_copies),
     ok = ekka_mnesia:copy_table(?MSG_TAB, ram_copies).
 
+%%--------------------------------------------------------------------
+%% DB API (mnesia)
+%%--------------------------------------------------------------------
+
+running_nodes() ->
+    ekka_mnesia:running_nodes().
+
+first_session_message() ->
+    mnesia:dirty_first(?SESS_MSG_TAB).
+
+next_session_message(Key) ->
+    mnesia:dirty_next(?SESS_MSG_TAB, Key).
+
+put_session_store(#session_store{} = SS) ->
+    ekka_mnesia:dirty_write(?SESSION_STORE, SS).
+
+delete_session_store(ClientID) ->
+    ekka_mnesia:dirty_delete(?SESSION_STORE, ClientID).
+
+lookup_session_store(ClientID) ->
+    case mnesia:dirty_read(?SESSION_STORE, ClientID) of
+        [] -> none;
+        [SS] -> {value, SS}
+    end.
+
+put_session_message({_, _, _, _} = Key) ->
+    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = Key }).
+
+put_message(Msg) ->
+    ekka_mnesia:dirty_write(?MSG_TAB, Msg).
+
+get_message(MsgId) ->
+    case mnesia:read(?MSG_TAB, MsgId) of
+        [] -> error({msg_not_found, MsgId});
+        [Msg] -> Msg
+    end.
+
+pending_messages_in_db(SessionID, MarkerIds) ->
+    {atomic, Res} = ekka_mnesia:ro_transaction(
+                      ?PERSISTENT_SESSION_SHARD,
+                      pending_messages_fun(SessionID, MarkerIds)
+                     ),
+    Res.
+
 
 %%--------------------------------------------------------------------
 %% Session API
@@ -126,7 +170,7 @@ persist(#{ clientid := ClientID }, ConnInfo, Session) ->
             case persistent_session_status(SS) of
                 not_persistent -> Session;
                 expired        -> discard(ClientID, Session);
-                persistent     -> ekka_mnesia:dirty_write(?SESSION_STORE, SS),
+                persistent     -> put_session_store(SS),
                                   Session
             end
     end.
@@ -138,9 +182,9 @@ timestamp_from_conninfo(ConnInfo) ->
     end.
 
 lookup(ClientID) when is_binary(ClientID) ->
-    case mnesia:dirty_read(?SESSION_STORE, ClientID) of
-        [] -> [];
-        [#session_store{session = S} = SS] ->
+    case lookup_session_store(ClientID) of
+        none -> [];
+        {value, #session_store{session = S} = SS} ->
             case persistent_session_status(SS) of
                 not_persistent -> []; %% For completeness. Should not happen
                 expired        -> [];
@@ -159,10 +203,9 @@ discard(ClientID) ->
 
 -spec discard(binary(), emgx_session:session()) -> emgx_session:session().
 discard(ClientID, Session) ->
-    ekka_mnesia:dirty_delete(?SESSION_STORE, ClientID),
+    delete_session_store(ClientID),
     SessionID = emqx_session:info(id, Session),
-    Key = {SessionID, <<>>, <<>>, ?ABANDONED},
-    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = Key }),
+    put_session_message({SessionID, <<>>, <<>>, ?ABANDONED}),
     Subscriptions = emqx_session:info(subscriptions, Session),
     emqx_session_router:delete_routes(SessionID, Subscriptions),
     emqx_session:set_field(is_persistent, false, Session).
@@ -170,8 +213,7 @@ discard(ClientID, Session) ->
 -spec mark_resume_begin(emqx_session:sessionID()) -> emqx_guid:guid().
 mark_resume_begin(SessionID) ->
     MarkerID = emqx_guid:gen(),
-    DBKey = {SessionID, MarkerID, <<>>, ?MARKER},
-    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = DBKey }),
+    put_session_message({SessionID, MarkerID, <<>>, ?MARKER}),
     MarkerID.
 
 add_subscription(TopicFilter, SessionID, true = _IsPersistent) ->
@@ -216,7 +258,7 @@ resume(ClientInfo = #{clientid := ClientID}, ConnInfo, Session) ->
     %% 3. Notify writers that we are resuming.
     %%    They will buffer new messages.
     ?tp(ps_notify_writers, #{sid => SessionID}),
-    Nodes = ekka_mnesia:running_nodes(),
+    Nodes = running_nodes(),
     NodeMarkers = resume_begin(Nodes, SessionID),
 
     %% 4. Subscribe to topics.
@@ -266,16 +308,14 @@ persist_message(Msg) ->
             case emqx_session_router:match_routes(emqx_message:topic(Msg)) of
                 [] -> ok;
                 Routes ->
-                    %% TODO: This should store in external backend
-                    ekka_mnesia:dirty_write(?MSG_TAB, Msg),
+                    put_message(Msg),
                     MsgId = emqx_message:id(Msg),
                     persist_message_routes(Routes, MsgId, Msg)
             end
     end.
 
 persist_message_routes([#route{dest = SessionID, topic = STopic}|Left], MsgId, Msg) ->
-    Key = {SessionID, MsgId, STopic, ?UNDELIVERED},
-    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = Key }),
+    put_session_message({SessionID, MsgId, STopic, ?UNDELIVERED}),
     emqx_session_router:buffer(SessionID, STopic, Msg),
     persist_message_routes(Left, MsgId, Msg);
 persist_message_routes([], _MsgId, _Msg) ->
@@ -283,8 +323,7 @@ persist_message_routes([], _MsgId, _Msg) ->
 
 mark_as_delivered(SessionID, [{deliver, STopic, Msg}|Left]) ->
     MsgID = emqx_message:id(Msg),
-    Key = {SessionID, MsgID, STopic, ?DELIVERED},
-    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = Key }),
+    put_session_message({SessionID, MsgID, STopic, ?DELIVERED}),
     mark_as_delivered(SessionID, Left);
 mark_as_delivered(_SessionID, []) ->
     ok.
@@ -325,12 +364,6 @@ persistent_session_status(#session_store{expiry_interval = E, ts = TS}) ->
 %% Pending messages internal functions
 %%--------------------------------------------------------------------
 
-pending_messages_in_db(SessionID, MarkerIds) ->
-    {atomic, Res} = ekka_mnesia:ro_transaction(
-                      ?PERSISTENT_SESSION_SHARD,
-                      pending_messages_fun(SessionID, MarkerIds)),
-    Res.
-
 pending_messages_fun(SessionID, MarkerIds) ->
     fun() ->
         case pending_messages({SessionID, <<>>, <<>>, ?DELIVERED}, [], MarkerIds) of
@@ -340,8 +373,7 @@ pending_messages_fun(SessionID, MarkerIds) ->
     end.
 
 read_pending_msgs([{MsgId, STopic}|Left], Acc) ->
-    [Msg] = mnesia:read(?MSG_TAB, MsgId),
-    read_pending_msgs(Left, [{deliver, STopic, Msg}|Acc]);
+    read_pending_msgs(Left, [{deliver, STopic, get_message(MsgId)}|Acc]);
 read_pending_msgs([], Acc) ->
     lists:reverse(Acc).
 
@@ -357,7 +389,7 @@ read_pending_msgs([], Acc) ->
 %% We traverse the table until we reach another session.
 %% TODO: Garbage collect the delivered messages.
 pending_messages({SessionID, PrevMsgId, PrevSTopic, PrevTag} = PrevKey, Acc, MarkerIds) ->
-    case mnesia:dirty_next(?SESS_MSG_TAB, PrevKey) of
+    case next_session_message(PrevKey) of
         {S, <<>>, <<>>, ?ABANDONED} when S =:= SessionID ->
             {[], []};
         {S, MsgId, <<>>, ?MARKER} = Key when S =:= SessionID ->
