@@ -693,17 +693,30 @@ abandoned_session_msg(SessionID, MicrosecondsAgo) ->
     TS = erlang:system_time(microsecond),
     {SessionID, <<>>, <<(TS - MicrosecondsAgo) : 64>>, ?ABANDONED}.
 
-fresh_gc_collect_fun() ->
+fresh_gc_delete_fun() ->
     Ets = ets:new(gc_collect, [ordered_set]),
     fun(delete,  Key) -> ets:insert(Ets, {Key}), ok;
-       (collect, <<>>)  -> List = ets:match(Ets, {'$1'}), ets:delete(Ets), lists:append(List);
+       (collect, <<>>) -> List = ets:match(Ets, {'$1'}), ets:delete(Ets), lists:append(List);
        (_, _Key) -> ok
     end.
 
-get_gc_messages() ->
-    Fun = fresh_gc_collect_fun(),
+fresh_gc_callbacks_fun() ->
+    Ets = ets:new(gc_collect, [ordered_set]),
+    fun(collect, <<>>) -> List = ets:match(Ets, {'$1'}), ets:delete(Ets), lists:append(List);
+       (Tag, Key) -> ets:insert(Ets, {{Key, Tag}}), ok;
+       (_, _Key) -> ok
+    end.
+
+get_gc_delete_messages() ->
+    Fun = fresh_gc_delete_fun(),
     emqx_persistent_session:gc_session_messages(Fun),
     Fun(collect, <<>>).
+
+get_gc_callbacks() ->
+    Fun = fresh_gc_callbacks_fun(),
+    emqx_persistent_session:gc_session_messages(Fun),
+    Fun(collect, <<>>).
+
 
 t_gc_all_delivered(Config) ->
     Store = ?config(store, Config),
@@ -714,7 +727,7 @@ t_gc_all_delivered(Config) ->
     Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
     SortedContent = lists:usort(Delivered ++ Undelivered),
     ets:insert(Store, [{X, <<>>} || X <- SortedContent]),
-    GCMessages = get_gc_messages(),
+    GCMessages = get_gc_delete_messages(),
     ?assertEqual(SortedContent, GCMessages),
     ok.
 
@@ -730,7 +743,7 @@ t_gc_some_undelivered(Config) ->
     Content = Delivered1 ++ Undelivered1 ++ Undelivered2,
     ets:insert(Store, [{X, <<>>} || X <- Content]),
     Expected = lists:usort(Delivered1 ++ Undelivered1),
-    GCMessages = get_gc_messages(),
+    GCMessages = get_gc_delete_messages(),
     ?assertEqual(Expected, GCMessages),
     ok.
 
@@ -749,7 +762,7 @@ t_gc_with_markers(Config) ->
     Content = Delivered1 ++ Undelivered1 ++ Undelivered2 ++ Markers,
     ets:insert(Store, [{X, <<>>} || X <- Content]),
     Expected = lists:usort(Delivered1 ++ Undelivered1),
-    GCMessages = get_gc_messages(),
+    GCMessages = get_gc_delete_messages(),
     ?assertEqual(Expected, GCMessages),
     ok.
 
@@ -766,8 +779,33 @@ t_gc_abandoned_some_undelivered(Config) ->
     Content = Delivered1 ++ Undelivered1 ++ Undelivered2 ++ [Abandoned],
     ets:insert(Store, [{X, <<>>} || X <- Content]),
     Expected = lists:usort(Delivered1 ++ Undelivered1 ++ Undelivered2),
-    GCMessages = get_gc_messages(),
+    GCMessages = get_gc_delete_messages(),
     ?assertEqual(Expected, GCMessages),
+    ok.
+
+t_gc_abandoned_only_called_on_empty_session(Config) ->
+    Store = ?config(store, Config),
+    STopic = ?config(stopic, Config),
+    SessionId = emqx_guid:gen(),
+    MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
+    Delivered = [delivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    Undelivered = [undelivered_msg(X, SessionId, STopic) || X <- MsgIds],
+    Abandoned = abandoned_session_msg(SessionId),
+    Content = Delivered ++ Undelivered ++ [Abandoned],
+    ets:insert(Store, [{X, <<>>} || X <- Content]),
+    GCMessages = get_gc_callbacks(),
+
+    %% Since we had messages to delete, we don't expect to get the
+    %% callback on the abandoned session
+    ?assertEqual([], [ X || {X, abandoned} <- GCMessages]),
+
+    %% But if we have only the abandoned session marker for this
+    %% session, it should be called.
+    ets:delete_all_objects(Store),
+    UndeliveredOtherSession = undelivered_msg(msg_id(), emqx_guid:gen(), <<"topic">>),
+    ets:insert(Store, [{X, <<>>} || X <- [Abandoned, UndeliveredOtherSession]]),
+    GCMessages2 = get_gc_callbacks(),
+    ?assertEqual([Abandoned], [ X || {X, abandoned} <- GCMessages2]),
     ok.
 
 t_gc_worker(init, Config) ->

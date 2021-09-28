@@ -328,7 +328,6 @@ gc_worker(Tag, Key) ->
                 false -> ok
             end;
         abandoned ->
-            %% TODO: Abandoned markers should be deleted last to make the process reentrant.
             TS = emqx_persistent_session:session_message_info(timestamp, Key),
             case TS + ?ABANDONED_GRACE_PERIOD < erlang:system_time(microsecond) of
                 true  ->

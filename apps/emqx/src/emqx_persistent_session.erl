@@ -450,8 +450,18 @@ gc_session_messages(Fun) ->
 gc_traverse('$end_of_table', _SessionID, _Abandoned, _Fun) ->
     ok;
 gc_traverse({S, <<>>, _TS, ?ABANDONED} = Key, _SessionID, _Abandoned, Fun) ->
-    ok = Fun(abandoned, Key),
-    gc_traverse(next_session_message(Key), S, true, Fun);
+    %% Only report the abandoned session if it has no messages.
+    %% We want to keep the abandoned marker to last to make the GC reentrant.
+    case next_session_message(Key) of
+        '$end_of_table' = NextKey ->
+            ok = Fun(abandoned, Key),
+            gc_traverse(NextKey, S, true, Fun);
+        {S2, _, _, _} = NextKey when S =:= S2 ->
+            gc_traverse(NextKey, S, true, Fun);
+        {_, _, _, _} = NextKey ->
+            ok = Fun(abandoned, Key),
+            gc_traverse(NextKey, S, true, Fun)
+    end;
 gc_traverse({S, _MsgID, <<>>, ?MARKER} = Key, SessionID, Abandoned, Fun) ->
     ok = Fun(marker, Key),
     NewAbandoned = S =:= SessionID andalso Abandoned,
