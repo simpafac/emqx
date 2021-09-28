@@ -57,6 +57,11 @@
         , code_change/3
         ]).
 
+-ifdef(TEST).
+-export([ gc_worker/2
+        ]).
+-endif.
+
 -type(group() :: binary()).
 
 -type(dest() :: node() | {group(), node()}).
@@ -64,6 +69,8 @@
 -define(ROUTE_TAB, emqx_session_route).
 
 -define(SESSION_INIT_TAB, session_init_tab).
+
+-define(GC_INTERVAL, 30000).
 
 %%--------------------------------------------------------------------
 %% Mnesia bootstrap
@@ -149,7 +156,7 @@ do_delete_route(Topic, SessionID) ->
 -spec(print_routes(emqx_topic:topic()) -> ok).
 print_routes(Topic) ->
     lists:foreach(fun(#route{topic = To, dest = SessionID}) ->
-                      io:format("~s -> ~s~n", [To, SessionID])
+                      io:format("~s -> ~p~n", [To, SessionID])
                   end, match_routes(Topic)).
 
 %%--------------------------------------------------------------------
@@ -203,7 +210,7 @@ pick(SessionID) when is_binary(SessionID) ->
 
 init([Pool, Id]) ->
     true = gproc_pool:connect_worker(Pool, {Pool, Id}),
-    {ok, #{pool => Pool, id => Id, pmon => emqx_pmon:new()}}.
+    {ok, start_gc_timer(#{pool => Pool, id => Id, pmon => emqx_pmon:new()})}.
 
 handle_call({resume_begin, RemotePid, SessionID}, _From, State) ->
     case init_resume_worker(RemotePid, SessionID, State) of
@@ -239,6 +246,9 @@ handle_cast(Msg, State) ->
     ?LOG(error, "Unexpected cast: ~p", [Msg]),
     {noreply, State}.
 
+handle_info({timeout, Ref, gc_timeout}, State) ->
+    State1 = gc_timeout(Ref, State),
+    {noreply, State1};
 handle_info(Info, State) ->
     ?LOG(error, "Unexpected info: ~p", [Info]),
     {noreply, State}.
@@ -268,6 +278,62 @@ init_resume_worker(RemotePid, SessionID, #{ pmon := Pmon } = State) ->
                     Pmon2 = emqx_pmon:demonitor(OldPid, Pmon1),
                     emqx_session_router_sup:abort_worker(OldPid),
                     {ok, Pid, State#{ pmon => Pmon2 }}
+            end
+    end.
+
+%%--------------------------------------------------------------------
+%% Garbage collection of session messages
+%%--------------------------------------------------------------------
+
+start_gc_timer(State) ->
+    State#{ gc_timer => erlang:start_timer(?GC_INTERVAL, self(), gc_timeout)}.
+
+gc_timeout(Ref, #{ gc_timer := R } = State) when R =:= Ref ->
+    %% Prevent overlapping processes.
+    GCPid = maps:get(gc_pid, State, undefined),
+    case GCPid =/= undefined andalso erlang:is_process_alive(GCPid) of
+        true  -> start_gc_timer(State);
+        false ->
+            Self = self(),
+            Filter = fun(Key) ->
+                         %% Only handle sessionID for this router
+                         pick(emqx_persistent_session:session_message_info(sessionID, Key)) =:= Self
+                     end,
+            start_gc_timer(State#{ gc_pid => proc_lib:spawn_link(fun() -> gc_worker(Filter) end)})
+    end;
+gc_timeout(_Ref, State) ->
+    State.
+
+
+gc_worker(Filter) ->
+    Fun = fun(Tag, Key) ->
+              Filter(Key) andalso gc_worker(Tag, Key),
+              ok
+          end,
+    ok = emqx_persistent_session:gc_session_messages(Fun).
+
+%% TODO: Maybe these should be configurable?
+-define(MARKER_GRACE_PERIOD, 60000000).
+-define(ABANDONED_GRACE_PERIOD, 300000000).
+
+gc_worker(Tag, Key) ->
+    case Tag of
+        delete ->
+            emqx_persistent_session:delete_session_message(Key);
+        marker ->
+            TS = emqx_persistent_session:session_message_info(timestamp, Key),
+            case TS + ?MARKER_GRACE_PERIOD < erlang:system_time(microsecond) of
+                true  ->
+                    emqx_persistent_session:delete_session_message(Key);
+                false -> ok
+            end;
+        abandoned ->
+            %% TODO: Abandoned markers should be deleted last to make the process reentrant.
+            TS = emqx_persistent_session:session_message_info(timestamp, Key),
+            case TS + ?ABANDONED_GRACE_PERIOD < erlang:system_time(microsecond) of
+                true  ->
+                    emqx_persistent_session:delete_session_message(Key);
+                false -> ok
             end
     end.
 

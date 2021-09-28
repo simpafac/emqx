@@ -16,8 +16,8 @@
 
 -module(emqx_persistent_session).
 
--export([ discard/1
-        , discard/2
+-export([ discard/2
+        , discard_if_present/1
         , lookup/1
         , persist/3
         , persist_message/1
@@ -35,14 +35,19 @@
         ]).
 
 -export([ pending_messages_in_db/2
+        , delete_session_message/1
+        , gc_session_messages/1
+        , session_message_info/2
         ]).
 
 -export([ mnesia/1
         ]).
 
+-export_type([ sess_msg_key/0
+             ]).
+
 -include("emqx.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
-
 
 -boot_mnesia({mnesia, [boot]}).
 -copy_mnesia({mnesia, [copy]}).
@@ -51,10 +56,18 @@
 
 %% NOTE: Order is significant because of traversal order of the table.
 -define(MARKER, 3).
--define(ABANDONED, 2).
--define(DELIVERED, 1).
--define(UNDELIVERED, 0).
--type pending_tag() :: ?DELIVERED | ?UNDELIVERED | ?ABANDONED | ?MARKER.
+-define(DELIVERED, 2).
+-define(UNDELIVERED, 1).
+-define(ABANDONED, 0).
+
+
+-type bin_timestamp() :: <<_:64>>.
+-opaque sess_msg_key() ::
+          {emqx_guid:guid(), emqx_guid:guid(), emqx_types:topic(), ?UNDELIVERED | ?DELIVERED}
+        | {emqx_guid:guid(), emqx_guid:guid(), <<>>              , ?MARKER}
+        | {emqx_guid:guid(), <<>>            , bin_timestamp()   , ?ABANDONED}.
+
+-type gc_traverse_fun() :: fun(('delete' | 'marker' | 'abandoned', sess_msg_key()) -> 'ok').
 
 %%--------------------------------------------------------------------
 %% Mnesia bootstrap
@@ -69,7 +82,7 @@
                        , ts               :: non_neg_integer()
                        , session          :: emqx_session:session()}).
 
--record(session_msg, {key      :: {binary(), binary(), emqx_guid:guid(), pending_tag()},
+-record(session_msg, {key      :: sess_msg_key(),
                       val = [] :: []}).
 
 mnesia(boot) ->
@@ -105,6 +118,15 @@ mnesia(copy) ->
     ok = ekka_mnesia:copy_table(?MSG_TAB, ram_copies).
 
 %%--------------------------------------------------------------------
+%% Session message ADT API
+%%--------------------------------------------------------------------
+
+-spec session_message_info('timestamp' | 'sessionID', sess_msg_key()) -> term().
+session_message_info(timestamp, {_, <<>>, <<TS:64>>, ?ABANDONED}) -> TS;
+session_message_info(timestamp, {_, GUID, _        , _         }) -> emqx_guid:timestamp(GUID);
+session_message_info(sessionID, {SessionID, _, _, _}) -> SessionID.
+
+%%--------------------------------------------------------------------
 %% DB API (mnesia)
 %%--------------------------------------------------------------------
 
@@ -116,6 +138,9 @@ first_session_message() ->
 
 next_session_message(Key) ->
     mnesia:dirty_next(?SESS_MSG_TAB, Key).
+
+delete_session_message(Key) ->
+    ekka_mnesia:dirty_delete(?SESS_MSG_TAB, Key).
 
 put_session_store(#session_store{} = SS) ->
     ekka_mnesia:dirty_write(?SESSION_STORE, SS).
@@ -192,8 +217,8 @@ lookup(ClientID) when is_binary(ClientID) ->
             end
     end.
 
--spec discard(binary()) -> 'ok'.
-discard(ClientID) ->
+-spec discard_if_present(binary()) -> 'ok'.
+discard_if_present(ClientID) ->
     case lookup(ClientID) of
         [] -> ok;
         [Session] ->
@@ -205,7 +230,7 @@ discard(ClientID) ->
 discard(ClientID, Session) ->
     delete_session_store(ClientID),
     SessionID = emqx_session:info(id, Session),
-    put_session_message({SessionID, <<>>, <<>>, ?ABANDONED}),
+    put_session_message({SessionID, <<>>, << (erlang:system_time(microsecond)) : 64>>, ?ABANDONED}),
     Subscriptions = emqx_session:info(subscriptions, Session),
     emqx_session_router:delete_routes(SessionID, Subscriptions),
     emqx_session:set_field(is_persistent, false, Session).
@@ -377,20 +402,20 @@ read_pending_msgs([{MsgId, STopic}|Left], Acc) ->
 read_pending_msgs([], Acc) ->
     lists:reverse(Acc).
 
-
 %% The keys are ordered by
-%%     {sessionID(), <<>>, <<>>, ?ABANDONED} For abandoned sessions (clean started or expired).
+%%     {sessionID(), <<>>, bin_timestamp(), ?ABANDONED} For abandoned sessions (clean started or expired).
 %%     {sessionID(), emqx_guid:guid(), STopic :: binary(), ?DELIVERED | ?UNDELIVERED | ?MARKER}
 %%  where
 %%     <<>> < emqx_guid:guid()
+%%     <<>> < bin_timestamp()
 %%     emqx_guid:guid() is ordered in ts() and by node()
-%%     ?UNDELIVERED < ?DELIVERED < ?MARKER
+%%     ?ABANDONED < ?UNDELIVERED < ?DELIVERED < ?MARKER
 %%
 %% We traverse the table until we reach another session.
 %% TODO: Garbage collect the delivered messages.
 pending_messages({SessionID, PrevMsgId, PrevSTopic, PrevTag} = PrevKey, Acc, MarkerIds) ->
     case next_session_message(PrevKey) of
-        {S, <<>>, <<>>, ?ABANDONED} when S =:= SessionID ->
+        {S, <<>>, _TS, ?ABANDONED} when S =:= SessionID ->
             {[], []};
         {S, MsgId, <<>>, ?MARKER} = Key when S =:= SessionID ->
             MarkerIds1 = MarkerIds -- [MsgId],
@@ -413,3 +438,44 @@ pending_messages({SessionID, PrevMsgId, PrevSTopic, PrevTag} = PrevKey, Acc, Mar
                 true  -> {lists:reverse([{PrevMsgId, PrevSTopic}|Acc]), MarkerIds}
             end
     end.
+
+%%--------------------------------------------------------------------
+%% Garbage collection
+%%--------------------------------------------------------------------
+
+-spec gc_session_messages(gc_traverse_fun()) -> 'ok'.
+gc_session_messages(Fun) ->
+    gc_traverse(first_session_message(), <<>>, false, Fun).
+
+gc_traverse('$end_of_table', _SessionID, _Abandoned, _Fun) ->
+    ok;
+gc_traverse({S, <<>>, _TS, ?ABANDONED} = Key, _SessionID, _Abandoned, Fun) ->
+    ok = Fun(abandoned, Key),
+    gc_traverse(next_session_message(Key), S, true, Fun);
+gc_traverse({S, _MsgID, <<>>, ?MARKER} = Key, SessionID, Abandoned, Fun) ->
+    ok = Fun(marker, Key),
+    NewAbandoned = S =:= SessionID andalso Abandoned,
+    gc_traverse(next_session_message(Key), S, NewAbandoned, Fun);
+gc_traverse({S, _MsgID, _STopic, _Tag} = Key, SessionID, Abandoned, Fun) when Abandoned andalso
+                                                                              S =:= SessionID ->
+    %% Delete all messages from an abandoned session.
+    ok = Fun(delete, Key),
+    gc_traverse(next_session_message(Key), S, Abandoned, Fun);
+gc_traverse({S, MsgID, STopic, ?UNDELIVERED} = Key, SessionID, Abandoned, Fun) ->
+    case next_session_message(Key) of
+        {S1, M, ST, ?DELIVERED} = NextKey when S1     =:= S andalso
+                                               MsgID  =:= M andalso
+                                               STopic =:= ST ->
+            %% We have both markers for the same message/topic so it is safe to delete both.
+            ok = Fun(delete, Key),
+            ok = Fun(delete, NextKey),
+            gc_traverse(next_session_message(NextKey), S, Abandoned, Fun);
+        NextKey ->
+            %% Something else is here, so let's just loop.
+            NewAbandoned = S =:= SessionID andalso Abandoned,
+            gc_traverse(NextKey, SessionID, NewAbandoned, Fun)
+    end;
+gc_traverse({S, _MsgID, _STopic, ?DELIVERED} = Key, SessionID, Abandoned, Fun) ->
+    %% We have a message that is marked as ?DELIVERED, but the ?UNDELIVERED is missing.
+    NewAbandoned = S =:= SessionID andalso Abandoned,
+    gc_traverse(next_session_message(Key), S, NewAbandoned, Fun).

@@ -213,7 +213,7 @@ open_session(true, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
     Self = self(),
     CleanStart = fun(_) ->
                      ok = discard_session(ClientId),
-                     ok = emqx_persistent_session:discard(ClientId),
+                     ok = emqx_persistent_session:discard_if_present(ClientId),
                      Session = create_session(ClientInfo, ConnInfo),
                      emqx_persistent_session:persist(ClientInfo, ConnInfo, Session),
                      register_channel(ClientId, Self, ConnInfo),
