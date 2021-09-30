@@ -19,6 +19,7 @@
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include("../src/emqx_persistent_session.hrl").
 
 -compile(export_all).
 -compile(nowarn_export_all).
@@ -28,10 +29,8 @@
 %%--------------------------------------------------------------------
 
 all() ->
-    [ {group, kill_connection_process}
-    , {group, no_kill_connection_process}
-    , {group, snabbkaffe}
-    , {group, gc_tests}
+    [ {group, persistent_store_enabled}
+    , {group, persistent_store_disabled}
     ].
 
 %% A persistent session can be resumed in two ways:
@@ -41,17 +40,23 @@ all() ->
 %%       The new process resumes the session from the stored state, and finds
 %%       any subscribed messages from the persistent message store.
 %%
-%% We want to test both these implementations, which is done through the top
-%% level groups {no_}kill_connection_process.
+%% We want to test both ways, both with the db backend enabled and disabled.
 %%
-%% In addition, we test both tcp and quic connections for both scenarios.
+%% In addition, we test both tcp and quic connections.
 
 groups() ->
     TCs = emqx_ct:all(?MODULE),
     SnabbkaffeTCs = [TC || TC <- TCs, is_snabbkaffe_tc(TC)],
     GCTests  = [TC || TC <- TCs, is_gc_tc(TC)],
     OtherTCs = (TCs -- SnabbkaffeTCs) -- GCTests,
-    [ {no_kill_connection_process, [], [{group, tcp}, {group, quic}]}
+    [ {persistent_store_enabled, [ {group, no_kill_connection_process}
+                                 , {group,    kill_connection_process}
+                                 , {group, snabbkaffe}
+                                 , {group, gc_tests}
+                                 ]}
+    , {persistent_store_disabled, [ {group, no_kill_connection_process}
+                                  ]}
+    , {no_kill_connection_process, [], [{group, tcp}, {group, quic}]}
     , {   kill_connection_process, [], [{group, tcp}, {group, quic}]}
     , {snabbkaffe, [], [{group, tcp_snabbkaffe}, {group, quic_snabbkaffe}]}
     , {tcp,  [], OtherTCs}
@@ -67,7 +72,24 @@ is_snabbkaffe_tc(TC) ->
 is_gc_tc(TC) ->
     re:run(atom_to_list(TC), "^t_gc_") /= nomatch.
 
-
+init_per_group(persistent_store_enabled, Config) ->
+    %% Start Apps
+    emqx_ct_helpers:boot_modules(all),
+    meck:new(emqx_config, [non_strict, passthrough, no_history, no_link]),
+    meck:expect(emqx_config, get, fun(?is_enabled_key) -> true;
+                                   (Other) -> meck:passthrough([Other])
+                                end),
+    emqx_ct_helpers:start_apps([], fun set_special_confs/1),
+    Config;
+init_per_group(persistent_store_disabled, Config) ->
+    %% Start Apps
+    emqx_ct_helpers:boot_modules(all),
+    meck:new(emqx_config, [non_strict, passthrough, no_history, no_link]),
+    meck:expect(emqx_config, get, fun(?is_enabled_key) -> false;
+                                   (Other) -> meck:passthrough([Other])
+                                end),
+    emqx_ct_helpers:start_apps([], fun set_special_confs/1),
+    Config;
 init_per_group(Group, Config) when Group == tcp; Group == tcp_snabbkaffe ->
     [ {port, 1883}, {conn_fun, connect}| Config];
 init_per_group(Group, Config) when Group == quic; Group == quic_snabbkaffe ->
@@ -96,24 +118,27 @@ init_per_group(gc_tests, Config) ->
     [{store_owner, Pid}, {store, Ets} | Config].
 
 init_per_suite(Config) ->
-    %% Start Apps
-    emqx_ct_helpers:boot_modules(all),
-    emqx_ct_helpers:start_apps([emqx], fun set_special_confs/1),
     Config.
 
 set_special_confs(emqx) ->
-    application:set_env(emqx, plugins_loaded_file,
-                        emqx_ct_helpers:deps_path(emqx, "test/emqx_SUITE_data/loaded_plugins"));
+    Path = emqx_ct_helpers:deps_path(emqx, "test/emqx_SUITE_data/loaded_plugins"),
+    application:set_env(emqx, plugins_loaded_file, Path);
 set_special_confs(_) ->
     ok.
 
 end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([]).
+    ok.
 
 end_per_group(gc_tests, Config) ->
     meck:unload(mnesia),
     ?config(store_owner, Config) ! stop,
     ok;
+end_per_group(persistent_store_enabled, _Config) ->
+    meck:unload(emqx_config),
+    emqx_ct_helpers:stop_apps([]);
+end_per_group(persistent_store_disabled, _Config) ->
+    meck:unload(emqx_config),
+    emqx_ct_helpers:stop_apps([]);
 end_per_group(_Group, _Config) ->
     ok.
 
@@ -149,18 +174,12 @@ preconfig_per_testcase(TestCase, Config) ->
                 %% We are running a single testcase
                 {atom_to_binary(TestCase),
                  init_per_group(tcp, init_per_group(kill_connection_process, Config))};
-            [{name, GroupName}] ->
-                case ?config(tc_group_path, Config) of
-                    [[{name,TopName}]] ->
-                        {iolist_to_binary([atom_to_binary(TopName), "_",
-                                           atom_to_binary(GroupName), "_",
-                                           atom_to_binary(TestCase)]),
-                         Config};
-                    [] ->
-                        {iolist_to_binary([atom_to_binary(GroupName), "_",
-                                           atom_to_binary(TestCase)]),
-                         Config}
-                end
+            [_|_] = Props->
+                Path = lists:reverse(?config(tc_group_path, Config) ++ Props),
+                Pre0 = [atom_to_list(N) || {name, N} <- lists:flatten(Path)],
+                Pre1 = lists:join("_", Pre0 ++ [atom_to_binary(TestCase)]),
+                {iolist_to_binary(Pre1),
+                 Config}
         end,
     [ {topic, iolist_to_binary([BaseName, "/foo"])}
     , {stopic, iolist_to_binary([BaseName, "/+"])}
@@ -201,7 +220,21 @@ maybe_kill_connection_process(ClientId, Config) ->
             ok
     end.
 
-publish(Topic, Payloads = [_|_], Config) ->
+snabbkaffe_sync_publish(Topic, Payloads, Config) ->
+    Fun = fun(Client, Payload) ->
+                  ?wait_async_action( {ok, _} = emqtt:publish(Client, Topic, Payload, 2)
+                                    , #{?snk_kind := ps_persist_msg, payload := Payload}
+                                    )
+          end,
+    do_publish(Payloads, Fun, Config).
+
+publish(Topic, Payloads, Config) ->
+    Fun = fun(Client, Payload) ->
+                  {ok, _} = emqtt:publish(Client, Topic, Payload, 2)
+          end,
+    do_publish(Payloads, Fun, Config).
+
+do_publish(Payloads = [_|_], PublishFun, Config) ->
     %% Publish from another process to avoid connection confusion.
     {Pid, Ref} =
         spawn_monitor(
@@ -210,17 +243,15 @@ publish(Topic, Payloads = [_|_], Config) ->
                   {ok, Client} = emqtt:start_link([ {proto_ver, v5}
                                                   | Config]),
                   {ok, _} = emqtt:ConnFun(Client),
-                  lists:foreach(fun(Payload) ->
-                                        {ok, _} = emqtt:publish(Client, Topic, Payload, 2)
-                                end, Payloads),
+                  lists:foreach(fun(Payload) -> PublishFun(Client, Payload)end, Payloads),
                   ok = emqtt:disconnect(Client)
           end),
     receive
         {'DOWN', Ref, process, Pid, normal} -> ok;
         {'DOWN', Ref, process, Pid, What} -> error({failed_publish, What})
     end;
-publish(Topic, Payload, Config) ->
-    publish(Topic, [Payload], Config).
+do_publish(Payload, PublishFun, Config) ->
+    do_publish([Payload], PublishFun, Config).
 
 %%--------------------------------------------------------------------
 %% Test Cases
@@ -593,23 +624,26 @@ t_snabbkaffe_pending_messages(Config) ->
     ok = emqtt:disconnect(Client1),
     maybe_kill_connection_process(ClientId, Config),
 
-    publish(Topic, Payloads, Config),
 
     ?check_trace(
        begin
+           snabbkaffe_sync_publish(Topic, Payloads, Config),
            {ok, Client2} = emqtt:start_link([{clean_start, false} | EmqttOpts]),
            {ok, _} = emqtt:ConnFun(Client2),
            Msgs = receive_messages(length(Payloads)),
            ReceivedPayloads = [P || #{ payload := P } <- Msgs],
-           ?assertEqual(lists:sort(ReceivedPayloads),
-                        lists:sort(Payloads)),
+           ?assertEqual(lists:sort(ReceivedPayloads), lists:sort(Payloads)),
            ok = emqtt:disconnect(Client2)
        end,
        fun(ok, Trace) ->
                check_snabbkaffe_vanilla(Trace),
-               %% Check that all messages was delivered in the initial pendings sweep
-               [Delivers] = ?projection(msgs, ?of_kind(ps_persist_pendings_msgs, Trace)),
-               ?assertEqual(length(Delivers), length(Payloads))
+               %% Check that all messages was delivered from the DB
+               [Delivers1] = ?projection(msgs, ?of_kind(ps_persist_pendings_msgs, Trace)),
+               [Delivers2] = ?projection(msgs, ?of_kind(ps_marker_pendings_msgs, Trace)),
+               Delivers = Delivers1 ++ Delivers2,
+               ?assertEqual(length(Payloads), length(Delivers)),
+               %% Check for no duplicates
+               ?assertEqual(lists:usort(Delivers), lists:sort(Delivers))
        end),
     ok.
 

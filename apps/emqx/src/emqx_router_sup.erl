@@ -38,21 +38,28 @@ init([]) ->
                                     [router_pool, hash,
                                      {emqx_router, start_link, []}]),
 
-    %% TODO: Should this be optional?
+    PersistentSessionSpecs = persistent_session_specs(),
 
-    %% We want this supervisor to own the table for restarts
-    SessionTab = emqx_session_router:create_init_tab(),
+    {ok, {{one_for_all, 0, 1}, [Helper, RouterPool] ++ PersistentSessionSpecs}}.
 
-    %% Resume worker sup
-    ResumeSup = #{id => router_worker_sup,
-                  start => {emqx_session_router_worker_sup, start_link, [SessionTab]},
-                  restart => permanent,
-                  shutdown => 2000,
-                  type => supervisor,
-                  modules => [emqx_session_router_worker_sup]},
+persistent_session_specs() ->
+    case emqx_persistent_session:is_store_enabled() of
+        false ->
+            [];
+        true ->
+            %% We want this supervisor to own the table for restarts
+            SessionTab = emqx_session_router:create_init_tab(),
 
-    SessionRouterPool = emqx_pool_sup:spec(session_router_pool,
-                                           [session_router_pool, hash,
-                                            {emqx_session_router, start_link, []}]),
-    {ok, {{one_for_all, 0, 1}, [Helper, RouterPool, ResumeSup, SessionRouterPool]}}.
+            %% Resume worker sup
+            ResumeSup = #{id => router_worker_sup,
+                          start => {emqx_session_router_worker_sup, start_link, [SessionTab]},
+                          restart => permanent,
+                          shutdown => 2000,
+                          type => supervisor,
+                          modules => [emqx_session_router_worker_sup]},
 
+            SessionRouterPool = emqx_pool_sup:spec(session_router_pool,
+                                                   [session_router_pool, hash,
+                                                    {emqx_session_router, start_link, []}]),
+            [ResumeSup, SessionRouterPool]
+    end.

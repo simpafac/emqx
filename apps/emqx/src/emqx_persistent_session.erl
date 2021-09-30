@@ -16,6 +16,10 @@
 
 -module(emqx_persistent_session).
 
+-export([ is_store_enabled/0
+        , init_db_backend/0
+        ]).
+
 -export([ discard/2
         , discard_if_present/1
         , lookup/1
@@ -40,17 +44,14 @@
         , session_message_info/2
         ]).
 
--export([ mnesia/1
-        ]).
-
 -export_type([ sess_msg_key/0
              ]).
 
 -include("emqx.hrl").
+-include("emqx_persistent_session.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
--boot_mnesia({mnesia, [boot]}).
--copy_mnesia({mnesia, [copy]}).
+-compile({inline, [is_store_enabled/0]}).
 
 -define(MAX_EXPIRY_INTERVAL, 4294967295000). %% 16#FFFFFFFF * 1000
 
@@ -70,52 +71,17 @@
 -type gc_traverse_fun() :: fun(('delete' | 'marker' | 'abandoned', sess_msg_key()) -> 'ok').
 
 %%--------------------------------------------------------------------
-%% Mnesia bootstrap
+%% Init
 %%--------------------------------------------------------------------
 
--define(SESSION_STORE, emqx_session_store).
--define(SESS_MSG_TAB, emqx_session_msg).
--define(MSG_TAB, emqx_persistent_msg).
+init_db_backend() ->
+    case is_store_enabled() of
+        true  -> persistent_term:put(?db_backend_key, emqx_persistent_session_mnesia_backend);
+        false -> persistent_term:put(?db_backend_key, emqx_persistent_session_dummy_backend)
+    end.
 
--record(session_store, { client_id        :: binary()
-                       , expiry_interval  :: non_neg_integer()
-                       , ts               :: non_neg_integer()
-                       , session          :: emqx_session:session()}).
-
--record(session_msg, {key      :: sess_msg_key(),
-                      val = [] :: []}).
-
-mnesia(boot) ->
-    ok = ekka_mnesia:create_table(?SESSION_STORE, [
-                {type, set},
-                {rlog_shard, ?PERSISTENT_SESSION_SHARD},
-                {ram_copies, [node()]},
-                {record_name, session_store},
-                {attributes, record_info(fields, session_store)},
-                {storage_properties, [{ets, [{read_concurrency, true}]}]}]),
-
-    ok = ekka_mnesia:create_table(?SESS_MSG_TAB, [
-                {type, ordered_set},
-                {rlog_shard, ?PERSISTENT_SESSION_SHARD},
-                {ram_copies, [node()]},
-                {record_name, session_msg},
-                {attributes, record_info(fields, session_msg)},
-                {storage_properties, [{ets, [{read_concurrency, true},
-                                             {write_concurrency, true}]}]}]),
-
-    ok = ekka_mnesia:create_table(?MSG_TAB, [
-                {type, set},
-                {rlog_shard, ?PERSISTENT_SESSION_SHARD},
-                {ram_copies, [node()]},
-                {record_name, message},
-                {attributes, record_info(fields, message)},
-                {storage_properties, [{ets, [{read_concurrency, true},
-                                             {write_concurrency, true}]}]}]);
-
-mnesia(copy) ->
-    ok = ekka_mnesia:copy_table(?SESSION_STORE, ram_copies),
-    ok = ekka_mnesia:copy_table(?SESS_MSG_TAB, ram_copies),
-    ok = ekka_mnesia:copy_table(?MSG_TAB, ram_copies).
+is_store_enabled() ->
+    emqx_config:get(?is_enabled_key).
 
 %%--------------------------------------------------------------------
 %% Session message ADT API
@@ -127,52 +93,38 @@ session_message_info(timestamp, {_, GUID, _        , _         }) -> emqx_guid:t
 session_message_info(sessionID, {SessionID, _, _, _}) -> SessionID.
 
 %%--------------------------------------------------------------------
-%% DB API (mnesia)
+%% DB API
 %%--------------------------------------------------------------------
 
-running_nodes() ->
-    ekka_mnesia:running_nodes().
-
 first_session_message() ->
-    mnesia:dirty_first(?SESS_MSG_TAB).
+    ?db_backend:first_session_message().
 
 next_session_message(Key) ->
-    mnesia:dirty_next(?SESS_MSG_TAB, Key).
+    ?db_backend:next_session_message(Key).
 
 delete_session_message(Key) ->
-    ekka_mnesia:dirty_delete(?SESS_MSG_TAB, Key).
+    ?db_backend:delete_session_message(Key).
 
-put_session_store(#session_store{} = SS) ->
-    ekka_mnesia:dirty_write(?SESSION_STORE, SS).
+put_session_store(SS) ->
+    ?db_backend:put_session_store(SS).
 
 delete_session_store(ClientID) ->
-    ekka_mnesia:dirty_delete(?SESSION_STORE, ClientID).
+    ?db_backend:delete_session_store(ClientID).
 
 lookup_session_store(ClientID) ->
-    case mnesia:dirty_read(?SESSION_STORE, ClientID) of
-        [] -> none;
-        [SS] -> {value, SS}
-    end.
+    ?db_backend:lookup_session_store(ClientID).
 
 put_session_message({_, _, _, _} = Key) ->
-    ekka_mnesia:dirty_write(?SESS_MSG_TAB, #session_msg{ key = Key }).
+    ?db_backend:put_session_message({_, _, _, _} = Key).
 
 put_message(Msg) ->
-    ekka_mnesia:dirty_write(?MSG_TAB, Msg).
+    ?db_backend:put_message(Msg).
 
 get_message(MsgId) ->
-    case mnesia:read(?MSG_TAB, MsgId) of
-        [] -> error({msg_not_found, MsgId});
-        [Msg] -> Msg
-    end.
+    ?db_backend:get_message(MsgId).
 
 pending_messages_in_db(SessionID, MarkerIds) ->
-    {atomic, Res} = ekka_mnesia:ro_transaction(
-                      ?PERSISTENT_SESSION_SHARD,
-                      pending_messages_fun(SessionID, MarkerIds)
-                     ),
-    Res.
-
+    ?db_backend:ro_transaction(pending_messages_fun(SessionID, MarkerIds)).
 
 %%--------------------------------------------------------------------
 %% Session API
@@ -228,6 +180,11 @@ discard_if_present(ClientID) ->
 
 -spec discard(binary(), emgx_session:session()) -> emgx_session:session().
 discard(ClientID, Session) ->
+    discard_opt(is_store_enabled(), ClientID, Session).
+
+discard_opt(false,_ClientID, Session) ->
+    emqx_session:set_field(is_persistent, false, Session);
+discard_opt(true, ClientID, Session) ->
     delete_session_store(ClientID),
     SessionID = emqx_session:info(id, Session),
     put_session_message({SessionID, <<>>, << (erlang:system_time(microsecond)) : 64>>, ?ABANDONED}),
@@ -283,7 +240,7 @@ resume(ClientInfo = #{clientid := ClientID}, ConnInfo, Session) ->
     %% 3. Notify writers that we are resuming.
     %%    They will buffer new messages.
     ?tp(ps_notify_writers, #{sid => SessionID}),
-    Nodes = running_nodes(),
+    Nodes = ekka_mnesia:running_nodes(),
     NodeMarkers = resume_begin(Nodes, SessionID),
 
     %% 4. Subscribe to topics.
@@ -296,7 +253,7 @@ resume(ClientInfo = #{clientid := ClientID}, ConnInfo, Session) ->
     Pendings3 = pending(SessionID, MarkerIDs),
     Pendings4 = emqx_session:ignore_local(Pendings3, ClientID, Session),
     ?tp(ps_marker_pendings_msgs, #{ sid => SessionID
-                                  , pendings => Pendings4}),
+                                  , msgs => Pendings4}),
 
     %% 6. Get pending messages from writers.
     ?tp(ps_resume_end, #{sid => SessionID}),
@@ -340,17 +297,24 @@ persist_message(Msg) ->
     end.
 
 persist_message_routes([#route{dest = SessionID, topic = STopic}|Left], MsgId, Msg) ->
+    ?tp(ps_persist_msg, #{sid => SessionID, payload => emqx_message:payload(Msg)}),
     put_session_message({SessionID, MsgId, STopic, ?UNDELIVERED}),
     emqx_session_router:buffer(SessionID, STopic, Msg),
     persist_message_routes(Left, MsgId, Msg);
 persist_message_routes([], _MsgId, _Msg) ->
     ok.
 
-mark_as_delivered(SessionID, [{deliver, STopic, Msg}|Left]) ->
+mark_as_delivered(SessionID, List) ->
+    case is_store_enabled() of
+        true  -> do_mark_as_delivered(SessionID, List);
+        false -> ok
+    end.
+
+do_mark_as_delivered(SessionID, [{deliver, STopic, Msg}|Left]) ->
     MsgID = emqx_message:id(Msg),
     put_session_message({SessionID, MsgID, STopic, ?DELIVERED}),
-    mark_as_delivered(SessionID, Left);
-mark_as_delivered(_SessionID, []) ->
+    do_mark_as_delivered(SessionID, Left);
+do_mark_as_delivered(_SessionID, []) ->
     ok.
 
 -spec pending(emqx_session:sessionID()) ->

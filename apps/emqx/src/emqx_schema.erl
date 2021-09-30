@@ -148,7 +148,17 @@ roots(low) ->
    , {"flapping_detect",
        sc(ref("flapping_detect"),
           #{})}
+   , {"persistent_session_store",
+       sc(ref("persistent_session_store"),
+          #{})}
     ].
+
+fields("persistent_session_store") ->
+    [ {"enabled",
+       sc(boolean(),
+          #{ default => "false"
+           })}
+    ];
 
 fields("stats") ->
     [ {"enable",
