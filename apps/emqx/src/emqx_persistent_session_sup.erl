@@ -44,5 +44,17 @@ init([]) ->
             SessionRouterPool = emqx_pool_sup:spec(session_router_pool,
                                                    [session_router_pool, hash,
                                                     {emqx_session_router, start_link, []}]),
-            {ok, {{one_for_all, 0, 1}, [ResumeSup, SessionRouterPool]}}
+
+            GCWorker = child_spec(emqx_persistent_session_gc, worker),
+
+            {ok, {{one_for_all, 0, 1}, [ResumeSup, SessionRouterPool, GCWorker]}}
     end.
+
+child_spec(Mod, worker) ->
+    #{id => Mod,
+      start => {Mod, start_link, []},
+      restart => permanent,
+      shutdown => 15000,
+      type => worker,
+      modules => [Mod]
+     }.

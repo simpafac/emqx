@@ -157,6 +157,18 @@ fields("persistent_session_store") ->
     [ {"enabled",
        sc(boolean(),
           #{ default => "false"
+           })},
+      {"max_retain_undelivered",
+       sc(duration(),
+          #{ default => "1h"
+           })},
+      {"message_gc_interval",
+       sc(duration(),
+          #{ default => "1h"
+           })},
+      {"session_message_gc_interval",
+       sc(duration(),
+          #{ default => "1m"
            })}
     ];
 

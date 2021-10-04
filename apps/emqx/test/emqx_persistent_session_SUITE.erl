@@ -737,8 +737,7 @@ fresh_gc_delete_fun() ->
 fresh_gc_callbacks_fun() ->
     Ets = ets:new(gc_collect, [ordered_set]),
     fun(collect, <<>>) -> List = ets:match(Ets, {'$1'}), ets:delete(Ets), lists:append(List);
-       (Tag, Key) -> ets:insert(Ets, {{Key, Tag}}), ok;
-       (_, _Key) -> ok
+       (Tag, Key) -> ets:insert(Ets, {{Key, Tag}}), ok
     end.
 
 get_gc_delete_messages() ->
@@ -842,14 +841,14 @@ t_gc_abandoned_only_called_on_empty_session(Config) ->
     ?assertEqual([Abandoned], [ X || {X, abandoned} <- GCMessages2]),
     ok.
 
-t_gc_worker(init, Config) ->
+t_session_gc_worker(init, Config) ->
     meck:new(emqx_persistent_session, [passthrough, no_link]),
     Config;
-t_gc_worker('end',_Config) ->
+t_session_gc_worker('end',_Config) ->
     meck:unload(emqx_persistent_session),
     ok.
 
-t_gc_worker(Config) ->
+t_session_gc_worker(Config) ->
     STopic = ?config(stopic, Config),
     SessionID = emqx_guid:gen(),
     MsgDeleted = delivered_msg(msg_id(), SessionID, STopic),
@@ -858,11 +857,11 @@ t_gc_worker(Config) ->
     AbandonedNotDeleted = abandoned_session_msg(SessionID),
     AbandonedDeleted = abandoned_session_msg(SessionID, 500 * 1000 * 1000),
     meck:expect(emqx_persistent_session, delete_session_message, fun(_Key) -> ok end),
-    emqx_session_router:gc_worker(delete, MsgDeleted),
-    emqx_session_router:gc_worker(marker, MarkerNotDeleted),
-    emqx_session_router:gc_worker(marker, MarkerDeleted),
-    emqx_session_router:gc_worker(abandoned, AbandonedDeleted),
-    emqx_session_router:gc_worker(abandoned, AbandonedNotDeleted),
+    emqx_persistent_session_gc:session_gc_worker(delete, MsgDeleted),
+    emqx_persistent_session_gc:session_gc_worker(marker, MarkerNotDeleted),
+    emqx_persistent_session_gc:session_gc_worker(marker, MarkerDeleted),
+    emqx_persistent_session_gc:session_gc_worker(abandoned, AbandonedDeleted),
+    emqx_persistent_session_gc:session_gc_worker(abandoned, AbandonedNotDeleted),
     History = meck:history(emqx_persistent_session, self()),
     DeleteCalls = [ Key || {_Pid, {_, delete_session_message, [Key]}, _Result}
                                <- History],
