@@ -16,7 +16,9 @@ bcrypt() ->
     {bcrypt, {git, "https://github.com/emqx/erlang-bcrypt.git", {branch, "0.6.0"}}}.
 
 quicer() ->
-    {quicer, {git, "https://github.com/emqx/quic.git", {tag, "0.0.8"}}}.
+    %%{quicer, {git, "https://github.com/emqx/quic.git", {tag, "0.0.8"}}}.
+    %% NOTE: Temporary fix to run CI. DO NOT MERGE!
+    {quicer, {git, "https://github.com/emqx/quic.git", {branch, "main"}}}.
 
 deps(Config) ->
     {deps, OldDeps} = lists:keyfind(deps, 1, Config),
