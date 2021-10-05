@@ -19,7 +19,7 @@
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
--include_lib("emqx/include/emqx.hrl").
+-include_lib("../include/emqx.hrl").
 -include("../src/emqx_persistent_session.hrl").
 
 -compile(export_all).
@@ -504,6 +504,34 @@ t_clean_start_drops_subscriptions(Config) ->
 
     ok = emqtt:disconnect(Client3).
 
+t_unsubscribe(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    Topic = ?config(topic, Config),
+    STopic = ?config(stopic, Config),
+    ClientId = ?config(client_id, Config),
+    {ok, Client} = emqtt:start_link([ {clientid, ClientId},
+                                      {proto_ver, v5},
+                                      {properties, #{'Session-Expiry-Interval' => 30}}
+                                    | Config]),
+    {ok, _} = emqtt:ConnFun(Client),
+    {ok, _, [2]} = emqtt:subscribe(Client, STopic, qos2),
+    case emqx_persistent_session:is_store_enabled() of
+        true ->
+            [Session] = emqx_persistent_session:lookup(ClientId),
+            SessionID = emqx_session:info(id, Session),
+            SessionIDs = [SId || #route{dest = SId} <- emqx_session_router:match_routes(Topic)],
+            ?assert(lists:member(SessionID, SessionIDs)),
+            ?assertMatch([_], [Sub || {ST, _} = Sub <- emqtt:subscriptions(Client), ST =:= STopic]),
+            {ok, _, _} = emqtt:unsubscribe(Client, STopic),
+            ?assertMatch([], [Sub || {ST, _} = Sub <- emqtt:subscriptions(Client), ST =:= STopic]),
+            SessionIDs2 = [SId || #route{dest = SId} <- emqx_session_router:match_routes(Topic)],
+            ?assert(not lists:member(SessionID, SessionIDs2));
+        false ->
+            ?assertMatch([_], [Sub || {ST, _} = Sub <- emqtt:subscriptions(Client), ST =:= STopic]),
+            {ok, _, _} = emqtt:unsubscribe(Client, STopic),
+            ?assertMatch([], [Sub || {ST, _} = Sub <- emqtt:subscriptions(Client), ST =:= STopic])
+    end,
+    ok = emqtt:disconnect(Client).
 
 t_multiple_subscription_matches(Config) ->
     ConnFun = ?config(conn_fun, Config),

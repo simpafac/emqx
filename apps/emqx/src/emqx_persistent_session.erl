@@ -218,7 +218,7 @@ add_subscription(_TopicFilter, _SessionID, false = _IsPersistent) ->
     ok.
 
 remove_subscription(TopicFilter, SessionID, true = _IsPersistent) ->
-    session_router:do_delete_route(TopicFilter, SessionID);
+    emqx_session_router:do_delete_route(TopicFilter, SessionID);
 remove_subscription(_TopicFilter, _SessionID, false = _IsPersistent) ->
     ok.
 
