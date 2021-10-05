@@ -44,6 +44,11 @@
         , session_message_info/2
         ]).
 
+-export([ delete_message/1
+        , first_message_id/0
+        , next_message_id/1
+        ]).
+
 -export_type([ sess_msg_key/0
              ]).
 
@@ -95,6 +100,15 @@ session_message_info(sessionID, {SessionID, _, _, _}) -> SessionID.
 %%--------------------------------------------------------------------
 %% DB API
 %%--------------------------------------------------------------------
+
+first_message_id() ->
+    ?db_backend:first_message_id().
+
+next_message_id(Key) ->
+    ?db_backend:next_message_id(Key).
+
+delete_message(Key) ->
+    ?db_backend:delete_message(Key).
 
 first_session_message() ->
     ?db_backend:first_session_message().
@@ -362,7 +376,16 @@ pending_messages_fun(SessionID, MarkerIds) ->
     end.
 
 read_pending_msgs([{MsgId, STopic}|Left], Acc) ->
-    read_pending_msgs(Left, [{deliver, STopic, get_message(MsgId)}|Acc]);
+    Acc1 = try [{deliver, STopic, get_message(MsgId)}|Acc]
+           catch error:{msg_not_found, _} ->
+                   HighwaterMark = erlang:system_time(millisecond)
+                       - emqx_config:get(?msg_retain) * 1000,
+                   case emqx_guid:ts(MsgId) < HighwaterMark of
+                       true  -> Acc;  %% Probably cleaned by GC
+                       false -> error({msg_not_found, MsgId})
+                   end
+           end,
+    read_pending_msgs(Left, Acc1);
 read_pending_msgs([], Acc) ->
     lists:reverse(Acc).
 

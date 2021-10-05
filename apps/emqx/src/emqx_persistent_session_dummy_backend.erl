@@ -16,10 +16,12 @@
 
 -module(emqx_persistent_session_dummy_backend).
 
--include("emqx.hrl").
 -include("emqx_persistent_session.hrl").
 
--export([ first_session_message/0
+-export([ first_message_id/0
+        , next_message_id/1
+        , delete_message/1
+        , first_session_message/0
         , next_session_message/1
         , delete_session_message/1
         , put_session_store/1
@@ -30,6 +32,15 @@
         , get_message/1
         , ro_transaction/1
         ]).
+
+first_message_id() ->
+    '$end_of_table'.
+
+next_message_id(_) ->
+    '$end_of_table'.
+
+delete_message(_Key) ->
+    error(should_not_be_called).
 
 first_session_message() ->
     '$end_of_table'.

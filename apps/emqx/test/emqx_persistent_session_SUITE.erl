@@ -19,6 +19,7 @@
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx.hrl").
 -include("../src/emqx_persistent_session.hrl").
 
 -compile(export_all).
@@ -103,19 +104,26 @@ init_per_group(snabbkaffe, Config) ->
 init_per_group(gc_tests, Config) ->
     %% We need to make sure the system does not interfere with this test group.
     emqx_ct_helpers:stop_apps([]),
-    Ets = gc_tests_store,
+    SessionMsgEts = gc_tests_session_store,
+    MsgEts = gc_tests_msg_store,
     Pid = spawn(fun() ->
-                        ets:new(Ets, [named_table, public, ordered_set]),
+                        ets:new(SessionMsgEts, [named_table, public, ordered_set]),
+                        ets:new(MsgEts, [named_table, public, ordered_set, {keypos, 2}]),
                         receive stop -> ok end
                 end),
     meck:new(mnesia, [non_strict, passthrough, no_history, no_link]),
-    meck:expect(mnesia, dirty_first, fun(emqx_session_msg) -> ets:first(Ets);
-                                        (X) -> meck:passtrhough(X)
+    meck:expect(mnesia, dirty_first, fun(?SESS_MSG_TAB) -> ets:first(SessionMsgEts);
+                                        (?MSG_TAB) -> ets:first(MsgEts);
+                                        (X) -> meck:passthrough(X)
                                      end),
-    meck:expect(mnesia, dirty_next, fun(emqx_session_msg, X) -> ets:next(Ets, X);
-                                       (Tab, X) -> meck:passtrough([Tab, X])
+    meck:expect(mnesia, dirty_next, fun(?SESS_MSG_TAB, X) -> ets:next(SessionMsgEts, X);
+                                       (?MSG_TAB, X) -> ets:next(MsgEts, X);
+                                       (Tab, X) -> meck:passthrough([Tab, X])
                                     end),
-    [{store_owner, Pid}, {store, Ets} | Config].
+    meck:expect(mnesia, dirty_delete, fun(?MSG_TAB, X) -> ets:delete(MsgEts, X);
+                                         (Tab, X) -> meck:passthrough([Tab, X])
+                                      end),
+    [{store_owner, Pid}, {session_msg_store, SessionMsgEts}, {msg_store, MsgEts} | Config].
 
 init_per_suite(Config) ->
     Config.
@@ -146,8 +154,8 @@ init_per_testcase(TestCase, Config) ->
     Config1 = preconfig_per_testcase(TestCase, Config),
     case is_gc_tc(TestCase) of
         true ->
-            Store = ?config(store, Config),
-            ets:delete_all_objects(Store);
+            ets:delete_all_objects(?config(msg_store, Config)),
+            ets:delete_all_objects(?config(session_msg_store, Config));
         false ->
             skip
     end,
@@ -752,7 +760,7 @@ get_gc_callbacks() ->
 
 
 t_gc_all_delivered(Config) ->
-    Store = ?config(store, Config),
+    Store = ?config(session_msg_store, Config),
     STopic = ?config(stopic, Config),
     SessionId = emqx_guid:gen(),
     MsgIds = [msg_id() || _ <- lists:seq(1, 5)],
@@ -765,7 +773,7 @@ t_gc_all_delivered(Config) ->
     ok.
 
 t_gc_some_undelivered(Config) ->
-    Store = ?config(store, Config),
+    Store = ?config(session_msg_store, Config),
     STopic = ?config(stopic, Config),
     SessionId = emqx_guid:gen(),
     MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
@@ -781,7 +789,7 @@ t_gc_some_undelivered(Config) ->
     ok.
 
 t_gc_with_markers(Config) ->
-    Store = ?config(store, Config),
+    Store = ?config(session_msg_store, Config),
     STopic = ?config(stopic, Config),
     SessionId = emqx_guid:gen(),
     MsgIds1 = [msg_id() || _ <- lists:seq(1, 10)],
@@ -800,7 +808,7 @@ t_gc_with_markers(Config) ->
     ok.
 
 t_gc_abandoned_some_undelivered(Config) ->
-    Store = ?config(store, Config),
+    Store = ?config(session_msg_store, Config),
     STopic = ?config(stopic, Config),
     SessionId = emqx_guid:gen(),
     MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
@@ -817,7 +825,7 @@ t_gc_abandoned_some_undelivered(Config) ->
     ok.
 
 t_gc_abandoned_only_called_on_empty_session(Config) ->
-    Store = ?config(store, Config),
+    Store = ?config(session_msg_store, Config),
     STopic = ?config(stopic, Config),
     SessionId = emqx_guid:gen(),
     MsgIds = [msg_id() || _ <- lists:seq(1, 10)],
@@ -841,14 +849,14 @@ t_gc_abandoned_only_called_on_empty_session(Config) ->
     ?assertEqual([Abandoned], [ X || {X, abandoned} <- GCMessages2]),
     ok.
 
-t_session_gc_worker(init, Config) ->
+t_gc_session_gc_worker(init, Config) ->
     meck:new(emqx_persistent_session, [passthrough, no_link]),
     Config;
-t_session_gc_worker('end',_Config) ->
+t_gc_session_gc_worker('end',_Config) ->
     meck:unload(emqx_persistent_session),
     ok.
 
-t_session_gc_worker(Config) ->
+t_gc_session_gc_worker(Config) ->
     STopic = ?config(stopic, Config),
     SessionID = emqx_guid:gen(),
     MsgDeleted = delivered_msg(msg_id(), SessionID, STopic),
@@ -867,10 +875,24 @@ t_session_gc_worker(Config) ->
                                <- History],
     ?assertEqual(lists:sort([MsgDeleted, AbandonedDeleted, MarkerDeleted]),
                  lists:sort(DeleteCalls)),
-
-
     ok.
 
+t_gc_message_gc(Config) ->
+    Topic = ?config(topic, Config),
+    ClientID = ?config(client_id, Config),
+    Store = ?config(msg_store, Config),
+    NewMsgs = [emqx_message:make(ClientID, Topic, integer_to_binary(P))
+               || P <- lists:seq(6, 10)],
+    Retain = 60 * 1000,
+    emqx_config:put(?msg_retain, Retain),
+    Msgs1 = [emqx_message:make(ClientID, Topic, integer_to_binary(P))
+             || P <- lists:seq(1, 5)],
+    OldMsgs = [M#message{id = guid(Retain*1000)} || M <- Msgs1],
+    ets:insert(Store, NewMsgs ++ OldMsgs),
+    ?assertEqual(lists:sort(OldMsgs ++ NewMsgs), ets:tab2list(Store)),
+    ok = emqx_persistent_session_gc:message_gc_worker(),
+    ?assertEqual(lists:sort(NewMsgs), ets:tab2list(Store)),
+    ok.
 
 split(List) ->
     split(List, [], []).

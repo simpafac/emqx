@@ -25,7 +25,10 @@
 -export([ mnesia/1
         ]).
 
--export([ first_session_message/0
+-export([ first_message_id/0
+        , next_message_id/1
+        , delete_message/1
+        , first_session_message/0
         , next_session_message/1
         , delete_session_message/1
         , put_session_store/1
@@ -76,13 +79,20 @@ mnesia_opt(true, copy) ->
     ok = ekka_mnesia:copy_table(?SESS_MSG_TAB, ram_copies),
     ok = ekka_mnesia:copy_table(?MSG_TAB, ram_copies).
 
-
-
 first_session_message() ->
     mnesia:dirty_first(?SESS_MSG_TAB).
 
 next_session_message(Key) ->
     mnesia:dirty_next(?SESS_MSG_TAB, Key).
+
+first_message_id() ->
+    mnesia:dirty_first(?MSG_TAB).
+
+next_message_id(Key) ->
+    mnesia:dirty_next(?MSG_TAB, Key).
+
+delete_message(Key) ->
+    ekka_mnesia:dirty_delete(?MSG_TAB, Key).
 
 delete_session_message(Key) ->
     ekka_mnesia:dirty_delete(?SESS_MSG_TAB, Key).
