@@ -1027,7 +1027,7 @@ handle_info(clean_authz_cache, Channel) ->
     {ok, Channel};
 
 handle_info(die_if_test = Info, Channel) ->
-    die_if_test(),
+    die_if_test_compiled(),
     ?LOG(error, "Unexpected info: ~p", [Info]),
     {ok, Channel};
 
@@ -1037,13 +1037,13 @@ handle_info(Info, Channel) ->
 
 -ifdef(TEST).
 
--spec die_if_test() -> no_return().
-die_if_test() ->
+-spec die_if_test_compiled() -> no_return().
+die_if_test_compiled() ->
     exit(normal).
 
 -else.
 
-die_if_test() ->
+die_if_test_compiled() ->
     ok.
 
 -endif.
