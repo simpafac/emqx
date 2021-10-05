@@ -69,22 +69,31 @@ mnesia(boot) ->
                         ]}],
     ok = ekka_mnesia:create_table(?TRIE, [
                 {rlog_shard, ?ROUTE_SHARD},
-                {ram_copies, [node()]},
+                {disc_copies, [node()]},
                 {record_name, ?TRIE},
                 {attributes, record_info(fields, ?TRIE)},
                 {type, ordered_set},
                 {storage_properties, StoreProps}]),
-    ok = ekka_mnesia:create_table(?SESSION_TRIE, [
-                {rlog_shard, ?ROUTE_SHARD},
-                {ram_copies, [node()]},
-                {record_name, ?TRIE},
-                {attributes, record_info(fields, ?TRIE)},
-                {type, ordered_set},
-                {storage_properties, StoreProps}]);
+
+    case emqx_persistent_session:is_store_enabled() of
+        true ->
+            ok = ekka_mnesia:create_table(?SESSION_TRIE, [
+                        {rlog_shard, ?ROUTE_SHARD},
+                        {disc_copies, [node()]},
+                        {record_name, ?TRIE},
+                        {attributes, record_info(fields, ?TRIE)},
+                        {type, ordered_set},
+                        {storage_properties, StoreProps}]);
+        false ->
+            ok
+    end;
 mnesia(copy) ->
     %% Copy topics table
-    ok = ekka_mnesia:copy_table(?SESSION_TRIE, ram_copies),
-    ok = ekka_mnesia:copy_table(?TRIE, ram_copies).
+    ok = ekka_mnesia:copy_table(?SESSION_TRIE, disc_copies),
+    case emqx_persistent_session:is_store_enabled() of
+        true  -> ok = ekka_mnesia:copy_table(?TRIE, disc_copies);
+        false -> ok
+    end.
 
 %%--------------------------------------------------------------------
 %% Topics APIs
