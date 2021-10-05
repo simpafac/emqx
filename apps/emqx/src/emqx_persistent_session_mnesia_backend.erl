@@ -42,8 +42,8 @@
 
 
 mnesia(Action) ->
-    Enabled = ?db_backend =:= ?MODULE,
-    mnesia_opt(Enabled, Action).
+    emqx_persistent_session:init_db_backend(),
+    mnesia_opt(?db_backend =:= ?MODULE, Action).
 
 mnesia_opt(false, _) ->
     ok;
