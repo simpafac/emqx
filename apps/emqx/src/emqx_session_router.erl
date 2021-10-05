@@ -266,7 +266,7 @@ init_resume_worker(RemotePid, SessionID, #{ pmon := Pmon } = State) ->
                     {ok, Pid, State#{ pmon => Pmon1 }};
                 {_, OldPid} ->
                     Pmon2 = emqx_pmon:demonitor(OldPid, Pmon1),
-                    emqx_session_router_sup:abort_worker(OldPid),
+                    emqx_session_router_worker_sup:abort_worker(OldPid),
                     {ok, Pid, State#{ pmon => Pmon2 }}
             end
     end.
