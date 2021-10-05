@@ -75,9 +75,9 @@ mnesia_opt(true, boot) ->
                                              {write_concurrency, true}]}]}]);
 
 mnesia_opt(true, copy) ->
-    ok = ekka_mnesia:copy_table(?SESSION_STORE, ram_copies),
-    ok = ekka_mnesia:copy_table(?SESS_MSG_TAB, ram_copies),
-    ok = ekka_mnesia:copy_table(?MSG_TAB, ram_copies).
+    ok = ekka_mnesia:copy_table(?SESSION_STORE, disc_copies),
+    ok = ekka_mnesia:copy_table(?SESS_MSG_TAB, disc_copies),
+    ok = ekka_mnesia:copy_table(?MSG_TAB, disc_copies).
 
 first_session_message() ->
     mnesia:dirty_first(?SESS_MSG_TAB).
