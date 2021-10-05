@@ -298,6 +298,12 @@ resume_end(Nodes, SessionID) ->
 %%--------------------------------------------------------------------
 
 persist_message(Msg) ->
+    case is_store_enabled() of
+        true  -> do_persist_message(Msg);
+        false -> ok
+    end.
+
+do_persist_message(Msg) ->
     case emqx_message:get_flag(dup, Msg) orelse emqx_message:is_sys(Msg) of
         true  -> ok;
         false ->
